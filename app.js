@@ -1,3 +1,4 @@
+/* СКиПП v4.3 Stable — итоговая сборка, без изменения формата данных. */
 (function(){
 'use strict';
 
@@ -369,7 +370,7 @@ function pinRecV2(){ const r = pinRec(); return r && r.v === 2 ? r : null; }
 function load(){
   try { const t = '__t'; localStorage.setItem(t, '1'); localStorage.removeItem(t); } catch (e) { STORAGE_OK = false; }
   let raw = null;
-  try { raw = localStorage.getItem(KEY); LAST_RAW = raw; BASELINE_READY = true; } catch (e) { raw = null; }
+  try { raw = localStorage.getItem(KEY); LAST_RAW = raw; BASELINE_READY = true; } catch (e) { setReadOnly(new Error('Не удалось прочитать локальное хранилище')); return; }
   if (raw) {
     let obj = null; try { obj = JSON.parse(raw); } catch (e) { console.error(e); }
     if (obj && obj.enc === 1) { D = blank(); D.savedAt = 0; SEC.locked = true; if (!pinRec()) setReadOnly(new Error('Зашифрованная база без записи PIN. Требуется восстановление доступа.')); return; }
@@ -455,6 +456,8 @@ function flushSettings() {
 }
 const HIST = {undo:[], redo:[]};
 function commit(fn){
+  SEARCH_TEXT_CACHE = new WeakMap();
+  URGENCY_KEY_CACHE = new WeakMap();
   // A second edit must not race an unfinished durable transaction.
   if (!PRIMARY_IDB_READY || STORAGE_READONLY || !STORAGE_OK || SEC.locked || PENDING_WRITES) {
     toast(PENDING_WRITES ? 'Подождите завершения сохранения' : 'Изменения заблокированы: сохранение недоступно'); return false;
@@ -519,6 +522,24 @@ function dueLabel(t){
   if (d === -1) return 'Вчера';
   return fmtShort(t.due) + (parseD(t.due).getFullYear() !== new Date().getFullYear() ? ' ' + parseD(t.due).getFullYear() : '');
 }
+// v4.0: cache urgency keys per render to avoid recalculating overdue status
+// O(n log n) times while sorting large lists. Keys are invalidated on edits.
+let URGENCY_KEY_CACHE = new WeakMap();
+function urgencyKey(t){
+  let key=URGENCY_KEY_CACHE.get(t);
+  if(!key){
+    const weights={high:0,mid:1,low:2};
+    key=[isOverdue(t)?0:1,t.due||'9999',weights[t.priority]??1,t.createdAt||0];
+    URGENCY_KEY_CACHE.set(t,key);
+  }
+  return key;
+}
+function urgencySortFast(a,b){
+  const x=urgencyKey(a),y=urgencyKey(b);
+  if(x[0]!==y[0])return x[0]-y[0];
+  if(x[1]!==y[1])return x[1]<y[1]?-1:1;
+  return (x[2]-y[2])||(x[3]-y[3]);
+}
 function urgencySort(a, b){
   const oa = isOverdue(a) ? 0 : 1, ob = isOverdue(b) ? 0 : 1;
   if (oa !== ob) return oa - ob;
@@ -542,9 +563,11 @@ function nextDue(t){
 }
 function spawnNext(t){
   if (!t.repeat || t.repeat === 'none' || t.spawned) return;
+  // v2.6: repeat creation is idempotent even for older records without spawned flag.
+  if (D.tasks.some(x => x.repeatParentId === t.id)) { t.spawned = true; return; }
   t.spawned = true;
   const n = clone(t);
-  Object.assign(n, {id:uid(), due:nextDue(t), status:firstT(), completedAt:null, archived:false, archivedAt:null, spawned:false, sentMeta:null, createdAt:Date.now(), updatedAt:Date.now(), order:Date.now()});
+  Object.assign(n, {id:uid(), repeatParentId:t.id, due:nextDue(t), status:firstT(), completedAt:null, archived:false, archivedAt:null, spawned:false, sentMeta:null, createdAt:Date.now(), updatedAt:Date.now(), order:Date.now()});
   n.assignees = (n.assignees || []).map(a => ({name:a.name, status:firstA()}));
   n.checklist = (n.checklist || []).map(i => ({id:uid(), text:i.text, done:false}));
   D.tasks.push(n);
@@ -672,7 +695,7 @@ function copyFallback(text){
 
 /* ================= состояние интерфейса ================= */
 const UKEY = 'skipp_offline_ui';
-const U = {tab:'dash', search:'', asg:'', showDone:{}, exp:{}, cal:{y:new Date().getFullYear(), m:new Date().getMonth()}, sel:today(), board:null, jFilter:'all', jSort:'date', subQ:'', clOpen:{}};
+const U = {tab:'dash', search:'', asg:'', showDone:{}, exp:{}, cal:{y:new Date().getFullYear(), m:new Date().getMonth()}, sel:today(), calMode:'month', board:null, jFilter:'all', jSort:'date', subQ:'', clOpen:{}};
 try { const u = JSON.parse(localStorage.getItem(UKEY) || '{}'); if (u.tab && SECTIONS.some(s => s.id === u.tab)) U.tab = u.tab; if (u.board) U.board = u.board; } catch (e) {}
 function saveUI(){ try { localStorage.setItem(UKEY, JSON.stringify({tab:U.tab, board:U.board})); } catch (e) {} }
 let toastTimer = null;
@@ -767,6 +790,16 @@ function openMore(){
   });
 }
 function go(tab){ U.tab = tab; U.search = ''; saveUI(); render(); window.scrollTo(0, 0); }
+// v3.0: аппаратная клавиатура — Alt+1…5, без перехвата ввода и диалогов.
+document.addEventListener('keydown', e => {
+  if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.repeat || !/^[1-5]$/.test(e.key)) return;
+  if (SHEETS.length || document.querySelector('.lock-screen:not([hidden]), .splash:not([hidden]), .tour:not([hidden])')) return;
+  const target = e.target;
+  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+  const id = TABBAR[Number(e.key) - 1];
+  if (!id) return;
+  e.preventDefault(); go(id);
+});
 
 /* ================= карточки ================= */
 function statusPill(id, ai, s, isStatic){
@@ -814,8 +847,14 @@ function viewToggle(key){
 function kanbanHtml(list, key){
   const cols = tSt();
   const ids = new Set(cols.map(s => s.id));
+  // One pass to distribute tasks; avoid filtering the full list per column.
+  const buckets = new Map(cols.map(s => [s.id, []]));
+  for(const t of list){
+    const status = ids.has(t.status) ? t.status : cols[0].id;
+    buckets.get(status).push(t);
+  }
   return '<div class="board-scroll" data-key="k-'+key+'"><div class="board">' + cols.map(s => {
-    const items = list.filter(t => (ids.has(t.status) ? t.status : cols[0].id) === s.id).sort((a, b) => (a.order || 0) - (b.order || 0));
+    const items = buckets.get(s.id).sort((a, b) => (a.order || 0) - (b.order || 0));
     return '<section class="col" data-drop="task" data-col="'+s.id+'" data-kind="'+key+'"><header class="col-h"><span class="dot" style="--c:'+s.color+'"></span><h3>'+esc(s.name)+'</h3><span class="n">'+items.length+'</span></header>'
       + '<div class="cards">' + (items.map(t => taskCard(t, {drag:true})).join('') || '<div class="empty-col">Пусто</div>') + '</div></section>';
   }).join('') + '</div></div><p class="hint">Чтобы сменить статус, нажмите плашку статуса на карточке или перетащите её в другой столбец (на телефоне — удерживайте; у края экрана столбцы прокручиваются сами).</p>';
@@ -830,7 +869,7 @@ function groupTasks(list){
     else if (t.due) g.later.push(t);
     else g.nodue.push(t);
   });
-  Object.keys(g).forEach(k => g[k].sort(urgencySort));
+  Object.keys(g).forEach(k => g[k].sort(urgencySortFast));
   return g;
 }
 const GROUPS = [['od','Просрочено','bad'],['td','Сегодня',''],['tm','Завтра',''],['later','Позже',''],['nodue','Без срока','']];
@@ -847,7 +886,18 @@ function groupsHtml(g, key){
   }
   return h;
 }
-const matchQ = t => { const q = U.search.trim().toLowerCase(); if (!q) return true; return (t.title || '').toLowerCase().includes(q) || (t.note || '').toLowerCase().includes(q) || (t.assignees || []).some(a => a.name.toLowerCase().includes(q)); };
+// Search strings are cached for the duration of a render only. This avoids stale
+// results when tasks or assignees are edited in place without a schema change.
+let SEARCH_TEXT_CACHE = new WeakMap();
+function taskSearchText(t){
+  let text = SEARCH_TEXT_CACHE.get(t);
+  if(text === undefined){
+    text = [t.title || '',t.note || '',...(t.assignees || []).map(a=>a.name || '')].join(' ').toLocaleLowerCase('ru');
+    SEARCH_TEXT_CACHE.set(t,text);
+  }
+  return text;
+}
+const matchQ = t => { const q=U.search.trim().toLocaleLowerCase('ru'); return !q || taskSearchText(t).includes(q); };
 const searchHtml = ph => '<div class="search">'+ic('search', 18)+'<input type="search" id="q-tasks" value="'+esc(U.search)+'" placeholder="'+esc(ph)+'" aria-label="Поиск" autocomplete="off"></div>';
 
 /* ================= Мои задачи ================= */
@@ -901,10 +951,10 @@ const DASH_WIDGETS = {
       + '<div class="tile'+(od ? ' bad' : '')+'"><b>'+od+'</b><span>Просрочено</span></div>'
       + '<div class="tile"><b>'+people.size+'</b><span>Исполнителей на контроле</span></div></div>';
   }},
-  od:{title:'Просроченные', render:() => dashList('od', 'Просроченные', 'bad', activeTasks().filter(isOverdue).sort(urgencySort))},
-  bn:{title:'Горящие', render:() => dashList('bn', 'Горящие: сегодня и завтра', '', activeTasks().filter(isBurning).sort(urgencySort))},
-  im:{title:'Важные', render:() => dashList('im', 'Высокий приоритет', '', activeTasks().filter(t => isImportant(t) && !isOverdue(t) && !isBurning(t)).sort(urgencySort))},
-  rm:{title:'Напоминания', render:() => dashList('rm', 'Сработали напоминания', '', activeTasks().filter(t => remindActive(t) && !isBurning(t) && !isOverdue(t)).sort(urgencySort))},
+  od:{title:'Просроченные', render:() => dashList('od', 'Просроченные', 'bad', activeTasks().filter(isOverdue).sort(urgencySortFast))},
+  bn:{title:'Горящие', render:() => dashList('bn', 'Горящие: сегодня и завтра', '', activeTasks().filter(isBurning).sort(urgencySortFast))},
+  im:{title:'Важные', render:() => dashList('im', 'Высокий приоритет', '', activeTasks().filter(t => isImportant(t) && !isOverdue(t) && !isBurning(t)).sort(urgencySortFast))},
+  rm:{title:'Напоминания', render:() => dashList('rm', 'Сработали напоминания', '', activeTasks().filter(t => remindActive(t) && !isBurning(t) && !isOverdue(t)).sort(urgencySortFast))},
   statuses:{title:'Задачи по статусам', render:() => {
     const all = activeTasks(); if (!all.length) return '';
     return '<section class="sec"><div class="sec-h"><h2>Мои статусы</h2></div><div class="panel"><div class="stack" role="img" aria-label="Распределение задач по статусам">'
@@ -966,13 +1016,14 @@ function viewDash(){
 /* ================= Календарь ================= */
 function viewCal(){
   const {y, m} = U.cal;
-  const first = new Date(y, m, 1), offset = (first.getDay() + 6) % 7, start = new Date(y, m, 1 - offset);
+  const weekMode = U.calMode === 'week';
+  const first = weekMode ? parseD(U.sel) : new Date(y, m, 1), offset = (first.getDay() + 6) % 7, start = new Date(first.getFullYear(), first.getMonth(), first.getDate() - offset);
   const by = {};
   activeTasks().forEach(t => { if (t.due) (by[t.due] = by[t.due] || []).push(t); });
   let cells = '';
-  for (let i = 0; i < 42; i++) {
+  for (let i = 0; i < (weekMode ? 7 : 42); i++) {
     const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i), ds = ymd(d);
-    const list = (by[ds] || []).sort(urgencySort);
+    const list = (by[ds] || []).sort(urgencySortFast);
     cells += '<button type="button" class="day'+(d.getMonth() !== m ? ' out' : '')+(ds === today() ? ' today' : '')+(ds === U.sel ? ' sel' : '')+'" data-a="pick-day" data-day="'+ds+'" aria-label="'+esc(d.toLocaleDateString('ru-RU', {day:'numeric', month:'long'}))+', задач: '+list.length+'">'
       + '<span class="n">'+d.getDate()+'</span>'
       + '<span class="dots">'+list.slice(0, 6).map(t => '<i class="'+(isOverdue(t) ? 'bad' : isDone(t) ? 'done' : '')+'"></i>').join('')+'</span>'
@@ -980,17 +1031,35 @@ function viewCal(){
       + (list.length > 3 ? '<span class="lbl" style="background:none;color:var(--ink-3)">+'+(list.length - 3)+'</span>' : '')
       + '</button>';
   }
-  const dayTasks = (by[U.sel] || []).sort(urgencySort);
-  let h = '<div class="cal-head"><h2>'+MONTHS[m]+' '+y+'</h2>'
+  const dayTasks = (by[U.sel] || []).sort(urgencySortFast);
+  let h = '<div class="cal-head"><h2>'+(weekMode ? 'Неделя · '+esc(start.toLocaleDateString('ru-RU',{day:'numeric',month:'short'})) : MONTHS[m]+' '+y)+'</h2>'
+    + '<button type="button" class="btn sm" data-a="cal-mode" aria-label="Переключить вид календаря">'+(weekMode?'Месяц':'Неделя')+'</button>'
     + '<button type="button" class="icon-btn" data-a="cal-prev" aria-label="Предыдущий месяц">'+ic('chevL')+'</button>'
     + '<button type="button" class="btn sm" data-a="cal-today">Сегодня</button>'
     + '<button type="button" class="icon-btn" data-a="cal-next" aria-label="Следующий месяц">'+ic('chevR')+'</button></div>'
     + '<div class="cal-grid">' + ['Пн','Вт','Ср','Чт','Пт','Сб','Вс'].map(d => '<div class="dow">'+d+'</div>').join('') + cells + '</div>'
     + '<div class="agenda"><div class="sec-h"><h2>'+esc(parseD(U.sel).toLocaleDateString('ru-RU', {weekday:'long', day:'numeric', month:'long'}))+'</h2><span class="n">'+(dayTasks.length || '')+'</span><span class="sp"></span><button type="button" class="btn sm" data-a="add-task-day">'+ic('plus', 16)+'На этот день</button></div>'
-    + (dayTasks.length ? '<div class="list grid2">' + dayTasks.map(t => taskCard(t, {compact:true})).join('') + '</div>' : '<p class="hint">На этот день задач нет.</p>') + '</div>';
+    + (dayTasks.length ? '<div class="list grid2">' + dayTasks.map(t => '<div class="cal-task-row">'+taskCard(t, {compact:true})+'<label class="cal-reschedule">Перенести срок <input type="date" data-change="cal-due" data-id="'+esc(t.id)+'" value="'+esc(t.due || '')+'" aria-label="Новый срок: '+esc(t.title)+'"></label></div>').join('') + '</div>' : '<p class="hint">На этот день задач нет.</p>') + '</div>';
   return h;
 }
 
+/* Progressive rendering for large boards; UI-only counters, no database migration. */
+const BOARD_BATCH=60;
+const BOARD_VISIBLE=new Map();
+function boardVisible(key,total){
+  const shown=BOARD_VISIBLE.get(key)||BOARD_BATCH;
+  return Math.min(total,shown);
+}
+function boardMore(key,total,shown){
+  return shown<total?'<button type="button" class="btn sm board-more" data-a="board-more" data-board-key="'+esc(key)+'">Показать ещё '+Math.min(BOARD_BATCH,total-shown)+' · '+shown+' из '+total+'</button>':'';
+}
+function groupByColumn(items,cols,field){
+  const grouped=new Map(cols.map(c=>[c.id,[]]));
+  const fallback=cols[0]&&cols[0].id;
+  for(const item of items){const id=grouped.has(item[field])?item[field]:fallback;if(id)grouped.get(id).push(item);}
+  for(const arr of grouped.values())arr.sort(byOrder);
+  return grouped;
+}
 /* ================= Доски ================= */
 function medalCols(){ return FIXED_MCOLS.concat(D.mcols.slice().sort(byOrder).map(c => Object.assign({kind:'month'}, c))); }
 function curBoard(){ const l = D.boards.slice().sort(byOrder); return l.find(b => b.id === U.board) || l[0] || null; }
@@ -1004,41 +1073,57 @@ function viewBoards(){
   if (b.kind === 'medals') h += '<button type="button" class="btn sm" data-a="add-mcol">'+ic('cal', 16)+'Месяц</button><button type="button" class="btn sm" data-a="bulk-people">Списком</button><button type="button" class="btn sm primary" data-a="add-person">'+ic('plus', 16)+'Человек</button>';
   h += '</div>';
   if (b.kind === 'medals') {
-    const cols = medalCols(), ids = new Set(cols.map(c => c.id)), colOf = p => ids.has(p.col) ? p.col : 'c_staff';
-    h += '<div class="board-scroll" data-key="medals"><div class="board">' + cols.map(c => {
-      const items = D.people.filter(p => colOf(p) === c.id).sort(byOrder);
+    const cols=medalCols();
+    const grouped=groupByColumn(D.people,cols,'col');
+    h+='<div class="board-scroll" data-key="medals"><div class="board">'+cols.map(c=>{
+      const items=grouped.get(c.id)||[];
+      const key='medals:'+c.id, shown=boardVisible(key,items.length);
       return '<section class="col" data-drop="person" data-col="'+c.id+'"><header class="col-h"><h3>'+esc(c.title)+'</h3><span class="n">'+items.length+'</span>'
-        + (c.kind === 'month' ? '<button type="button" class="icon-btn" style="width:32px;height:32px" data-a="edit-mcol" data-id="'+c.id+'" aria-label="Настроить столбец">'+ic('more', 18)+'</button>' : '') + '</header>'
-        + (c.note ? '<div class="col-note">'+esc(c.note)+'</div>' : '')
-        + '<div class="cards">' + (items.map(p => '<div class="card" data-open="person" data-id="'+p.id+'" data-drag="person"><div class="t-title">'+esc(p.fio)+'</div>'
-            + (p.award ? '<div class="award">'+ic('medal', 16)+'<span>'+esc(p.award)+'</span></div>' : '')
-            + (p.existing ? '<div class="t-note">Имеет: '+esc(p.existing)+'</div>' : '') + '</div>').join('') || '<div class="empty-col">Пусто</div>') + '</div></section>';
-    }).join('') + '</div></div>';
-    return h + '<p class="hint">Карточку можно перетащить в другой столбец — удерживайте её на телефоне.</p>';
+        +(c.kind==='month'?'<button type="button" class="icon-btn" style="width:32px;height:32px" data-a="edit-mcol" data-id="'+c.id+'" aria-label="Настроить столбец">'+ic('more',18)+'</button>':'')+'</header>'
+        +(c.note?'<div class="col-note">'+esc(c.note)+'</div>':'')
+        +'<div class="cards">'+(items.slice(0,shown).map(p=>'<div class="card" data-open="person" data-id="'+p.id+'" data-drag="person"><div class="t-title">'+esc(p.fio)+'</div>'
+          +(p.award?'<div class="award">'+ic('medal',16)+'<span>'+esc(p.award)+'</span></div>':'')
+          +(p.existing?'<div class="t-note">Имеет: '+esc(p.existing)+'</div>':'')+'</div>').join('')||'<div class="empty-col">Пусто</div>')+'</div>'
+        +boardMore(key,items.length,shown)+'</section>';
+    }).join('')+'</div></div>';
+    return h+'<p class="hint">Карточку можно перетащить в другой столбец — удерживайте её на телефоне.</p>';
   }
-  const cols = b.cols || [];
-  if (!cols.length) return h + '<div class="empty">В доске нет столбцов.<br><button type="button" class="btn primary" data-a="board-settings">Добавить столбцы</button></div>';
-  const ids = new Set(cols.map(c => c.id)), cards = D.bcards.filter(c => c.board === b.id);
-  h += '<div class="board-scroll" data-key="b-'+b.id+'"><div class="board">' + cols.map(c => {
-    const items = cards.filter(x => (ids.has(x.col) ? x.col : cols[0].id) === c.id).sort(byOrder);
+  const cols=b.cols||[];
+  if(!cols.length)return h+'<div class="empty">В доске нет столбцов.<br><button type="button" class="btn primary" data-a="board-settings">Добавить столбцы</button></div>';
+  const grouped=groupByColumn(D.bcards.filter(c=>c.board===b.id),cols,'col');
+  h+='<div class="board-scroll" data-key="b-'+b.id+'"><div class="board">'+cols.map(c=>{
+    const items=grouped.get(c.id)||[];
+    const key='board:'+b.id+':'+c.id,shown=boardVisible(key,items.length);
     return '<section class="col" data-drop="bcard" data-col="'+c.id+'"><header class="col-h"><h3>'+esc(c.title)+'</h3><span class="n">'+items.length+'</span></header>'
-      + '<div class="cards">' + (items.map(x => '<div class="card" data-open="bcard" data-id="'+x.id+'" data-drag="bcard"><div class="t-title">'+esc(x.title)+'</div>'+(x.note ? '<div class="t-note">'+esc(x.note)+'</div>' : '')+(x.remark ? '<div class="t-rem"><b>Примечание:</b> '+esc(x.remark)+'</div>' : '')+'</div>').join('') || '<div class="empty-col">Пусто</div>') + '</div>'
-      + '<button type="button" class="col-add" data-a="add-bcard" data-col="'+c.id+'">+ Карточка</button></section>';
-  }).join('') + '</div></div>';
-  return h + '<p class="hint">Карточку можно перетащить в другой столбец — удерживайте её на телефоне.</p>';
+      +'<div class="cards">'+(items.slice(0,shown).map(x=>'<div class="card" data-open="bcard" data-id="'+x.id+'" data-drag="bcard"><div class="t-title">'+esc(x.title)+'</div>'+(x.note?'<div class="t-note">'+esc(x.note)+'</div>':'')+(x.remark?'<div class="t-rem"><b>Примечание:</b> '+esc(x.remark)+'</div>':'')+'</div>').join('')||'<div class="empty-col">Пусто</div>')+'</div>'
+      +boardMore(key,items.length,shown)
+      +'<button type="button" class="col-add" data-a="add-bcard" data-col="'+c.id+'">+ Карточка</button></section>';
+  }).join('')+'</div></div>';
+  return h+'<p class="hint">Карточку можно перетащить в другой столбец — удерживайте её на телефоне.</p>';
+
 }
 
 /* ================= Абоненты ================= */
+const SUB_SEARCH_INDEX=new WeakMap();
+function subSearchText(p){
+  const stamp=String(p.name||'')+'\u0000'+String(p.phone||'')+'\u0000'+String(p.address||'');
+  const cached=SUB_SEARCH_INDEX.get(p);
+  if(cached && cached.stamp===stamp)return cached.text;
+  const text=stamp.toLocaleLowerCase('ru');
+  SUB_SEARCH_INDEX.set(p,{stamp,text});
+  return text;
+}
 function viewSubs(){
   const all = D.subs.slice().sort((a, b) => (a.name || '').localeCompare(b.name || '', 'ru'));
   let h = '<div class="bar">' + (all.length > 5 ? '<div class="search">'+ic('search', 18)+'<input type="search" id="sub-q" value="'+esc(U.subQ)+'" placeholder="Поиск по имени, номеру, адресу" aria-label="Поиск абонента" autocomplete="off"></div>' : '<span class="sp"></span>')
     + '<button type="button" class="btn primary" data-a="add-sub">'+ic('plus', 18)+'Абонент</button></div>';
   if (!all.length) return h + '<div class="empty"><b>Справочник пуст</b>Добавьте абонентов — их имена будут подсказываться при выборе исполнителей.</div>';
   const q = U.subQ.trim().toLowerCase();
-  const list = q ? all.filter(p => [p.name, p.phone, p.address].some(v => (v || '').toLowerCase().includes(q))) : all;
+  const list = q ? all.filter(p => subSearchText(p).includes(q)) : all;
   if (!list.length) return h + '<div class="empty">Никого не найдено.</div>';
+  const page = pageWindow(list,'subs',PAGE_SIZE_SUBS,U.subQ.trim().toLowerCase());
   let last = '', rows = '';
-  list.forEach(p => {
+  page.items.forEach(p => {
     const L = (p.name || '?').charAt(0).toUpperCase();
     if (L !== last && !q) { if (rows) rows += '</div>'; rows += '<div class="letter">'+esc(L)+'</div><div class="rows">'; last = L; }
     else if (!rows) rows += '<div class="rows">';
@@ -1047,7 +1132,7 @@ function viewSubs(){
       + (p.phone ? '<div class="side-r"><a class="icon-btn" href="tel:'+esc(p.phone.replace(/[^\d+]/g, ''))+'" target="_top" aria-label="Позвонить">'+ic('phone', 18)+'</a><button type="button" class="icon-btn" data-a="copy-phone" data-id="'+p.id+'" aria-label="Скопировать номер">'+ic('copy', 18)+'</button></div>' : '')
       + '</div>';
   });
-  return h + rows + '</div>';
+  return h + rows + '</div>' + pageControls(page,'subs');
 }
 
 /* ================= ЖУПиОР ================= */
@@ -1062,18 +1147,23 @@ function viewJournal(){
     + '<button type="button" class="btn sm" data-a="export-journal">'+ic('download', 16)+'Excel</button>'
     + '<button type="button" class="btn primary" data-a="add-j">'+ic('plus', 18)+'Запись</button></div>';
   if (!list.length) return h + '<div class="empty"><b>Записей нет</b>Вносите сюда отданные и полученные распоряжения. Из карточки указания запись создаётся кнопкой «Внести в ЖУПиОР».</div>';
-  return h + '<div class="rows">' + list.map(d => '<div class="row" data-open="j" data-id="'+d.id+'"><div class="jn"><b>№ '+esc(d.number || '—')+'</b><small>'+esc(fmtFull(d.date) || 'без даты')+'</small></div>'
-    + '<div class="main"><div class="ttl">'+esc(d.brief || '')+'</div><div class="sub"><span class="dir '+(d.direction === 'in' ? 'in' : 'out')+'">'+(d.direction === 'in' ? 'Получено' : 'Отдано')+'</span> '+esc(d.party || '')+'</div></div></div>').join('') + '</div>';
+  const page=pageWindow(list,'journal',PAGE_SIZE_JOURNAL,JSON.stringify([U.jFilter,U.jSort]));
+  return h + '<div class="rows">' + page.items.map(d => '<div class="row" data-open="j" data-id="'+d.id+'"><div class="jn"><b>№ '+esc(d.number || '—')+'</b><small>'+esc(fmtFull(d.date) || 'без даты')+'</small></div>'
+    + '<div class="main"><div class="ttl">'+esc(d.brief || '')+'</div><div class="sub"><span class="dir '+(d.direction === 'in' ? 'in' : 'out')+'">'+(d.direction === 'in' ? 'Получено' : 'Отдано')+'</span> '+esc(d.party || '')+'</div></div></div>').join('') + '</div>'+pageControls(page,'journal');
 }
 
 /* ================= Архив ================= */
 function viewArchive(){
-  const list = D.tasks.filter(t => t.archived);
+  const list = D.tasks.filter(t => t.archived).sort((a,b) => {
+    const da=a.completedAt||a.archivedAt||0, db=b.completedAt||b.archivedAt||0;
+    return db-da;
+  });
   if (!list.length) return '<div class="empty"><b>Архив пуст</b>Задачи со статусом «Выполнено» или «Отправлено» переходят сюда на следующий день.</div>';
+  const page=pageWindow(list,'archive',PAGE_SIZE_ARCHIVE,'archive');
   const groups = {};
-  list.forEach(t => { const d = t.completedAt ? ymd(new Date(t.completedAt)) : (t.archivedAt ? ymd(new Date(t.archivedAt)) : '—'); (groups[d] = groups[d] || []).push(t); });
+  page.items.forEach(t => { const d = t.completedAt ? ymd(new Date(t.completedAt)) : (t.archivedAt ? ymd(new Date(t.archivedAt)) : '—'); (groups[d] = groups[d] || []).push(t); });
   let h = '<div class="bar"><span class="hint" style="margin:0">Всего: '+list.length+'</span><span class="sp"></span><button type="button" class="btn sm danger-o" data-a="clear-archive">'+ic('trash', 16)+'Очистить архив</button></div>';
-  return h + Object.keys(groups).sort((a, b) => b.localeCompare(a)).map(d => '<section class="sec"><div class="sec-h"><h2>'+esc(d === '—' ? 'Без даты' : 'Выполнено '+fmtFull(d))+'</h2><span class="n">'+groups[d].length+'</span></div><div class="list grid2">'+groups[d].map(t => taskCard(t, {archive:true})).join('')+'</div></section>').join('');
+  return h + Object.keys(groups).sort((a, b) => b.localeCompare(a)).map(d => '<section class="sec"><div class="sec-h"><h2>'+esc(d === '—' ? 'Без даты' : 'Выполнено '+fmtFull(d))+'</h2><span class="n">'+groups[d].length+'</span></div><div class="list grid2">'+groups[d].map(t => taskCard(t, {archive:true})).join('')+'</div></section>').join('') + pageControls(page,'archive');
 }
 
 /* ================= отрисовка ================= */
@@ -1082,16 +1172,50 @@ function viewTrash(){
   let h = '<div class="bar"><span class="hint" style="margin:0">Удалённое хранится 30 дней, затем стирается само. Карточку можно перетащить сюда из любого списка — появится зона «В корзину».</span><span class="sp"></span>'
     + (list.length ? '<button type="button" class="btn sm danger-o" data-a="trash-clear">'+ic('trash', 16)+'Очистить корзину</button>' : '') + '</div>';
   if (!list.length) return h + '<div class="empty"><b>Корзина пуста</b>Удалённые задачи, карточки, абоненты и записи журнала попадают сюда.</div>';
-  return h + '<div class="rows">' + list.map(x => '<div class="row" style="cursor:default"><div class="main"><div class="ttl">'+esc(trashLabel(x))+'</div><div class="sub">'+esc(TRASH_KIND[x.kind] || '')+' · удалено '+esc(fmtDT(x.deletedAt))+'</div></div>'
-    + '<div class="side-r"><button type="button" class="btn sm" data-a="trash-restore" data-id="'+x.id+'">'+ic('restore', 16)+'<span class="hide-s">Восстановить</span></button><button type="button" class="icon-btn" data-a="trash-del" data-id="'+x.id+'" aria-label="Удалить навсегда" title="Удалить навсегда">'+ic('x', 18)+'</button></div></div>').join('') + '</div>';
+  const page=pageWindow(list,'trash',PAGE_SIZE_TRASH,'trash');
+  return h + '<div class="rows">' + page.items.map(x => '<div class="row" style="cursor:default"><div class="main"><div class="ttl">'+esc(trashLabel(x))+'</div><div class="sub">'+esc(TRASH_KIND[x.kind] || '')+' · удалено '+esc(fmtDT(x.deletedAt))+'</div></div>'
+    + '<div class="side-r"><button type="button" class="btn sm" data-a="trash-restore" data-id="'+x.id+'">'+ic('restore', 16)+'<span class="hide-s">Восстановить</span></button><button type="button" class="icon-btn" data-a="trash-del" data-id="'+x.id+'" aria-label="Удалить навсегда" title="Удалить навсегда">'+ic('x', 18)+'</button></div></div>').join('') + '</div>' + pageControls(page,'trash');
 }
 
 /* ===== СКиПП 2.x: дополнительные представления, без миграции базы ===== */
 const EXT = {q:'', status:'all', priority:'all', scope:'all', period:'week'};
+const EXT_FILTER_FIELDS = ['q','status','priority','scope'];
+// v2.9: ephemeral selection, never added to persisted schema.
+const EXT_BULK = new Set();
+function extSavedFilters(){
+  const items = D.settings && D.settings.savedSearches;
+  if (!Array.isArray(items)) return [];
+  return items.filter(x => x && typeof x==='object' && typeof x.id==='string' && typeof x.name==='string' && x.filter && typeof x.filter==='object').slice(0,20);
+}
+function extFilterSnapshot(){
+  return Object.fromEntries(EXT_FILTER_FIELDS.map(k=>[k,String(EXT[k]||'').slice(0,300)]));
+}
+function extApplyFilter(f){
+  const allowed = {status:['all','active','done','overdue'],priority:['all','high','mid','low'],scope:['all','mine','orders']};
+  EXT.q=typeof f.q==='string'?f.q.slice(0,300):'';
+  for(const k of ['status','priority','scope']) EXT[k]=allowed[k].includes(f[k])?f[k]:'all';
+}
+function extSaveFilter(){
+  const name=window.prompt('Название фильтра (до 60 символов)');
+  if(name===null) return;
+  const clean=name.trim().slice(0,60);
+  if(!clean){toast('Введите название фильтра');return;}
+  if(extSavedFilters().length>=20){toast('Можно сохранить не более 20 фильтров');return;}
+  const filter=extFilterSnapshot();
+  if(commit(()=>{
+    if(!Array.isArray(D.settings.savedSearches)) D.settings.savedSearches=[];
+    D.settings.savedSearches.push({id:uid(),name:clean,filter});
+  })) toast('Фильтр добавлен в очередь сохранения');
+}
+function extRemoveFilter(id){
+  if(!window.confirm('Удалить сохранённый фильтр?')) return;
+  commit(()=>{D.settings.savedSearches=extSavedFilters().filter(x=>x.id!==id);});
+}
+
 const extInput = (id, label, value) => '<label class="ext-label">'+esc(label)+'<input id="'+id+'" value="'+esc(value)+'" autocomplete="off"></label>';
 function extTaskMatches(t){
   const q=EXT.q.trim().toLocaleLowerCase('ru');
-  if(q && ![t.title,t.note,(t.assignees||[]).map(a=>a.name).join(' ')].join(' ').toLocaleLowerCase('ru').includes(q)) return false;
+  if(q && !taskSearchText(t).includes(q)) return false;
   if(EXT.status==='active' && (t.archived||isDone(t))) return false;
   if(EXT.status==='done' && !isDone(t)) return false;
   if(EXT.status==='overdue' && !isOverdue(t)) return false;
@@ -1100,60 +1224,345 @@ function extTaskMatches(t){
   if(EXT.scope==='orders' && !hasAsg(t)) return false;
   return true;
 }
+function extBulkSelection(){
+  // Only currently visible, non-archived tasks can be modified.
+  return D.tasks.filter(t=>EXT_BULK.has(t.id) && !t.archived && extTaskMatches(t));
+}
+function extBulkApply(){
+  const chosen=extBulkSelection();
+  if(!chosen.length){toast('Выберите задачи из текущего списка');return;}
+  const action=document.getElementById('ext-bulk-action')?.value;
+  const value=document.getElementById('ext-bulk-value')?.value || '';
+  if(!['priority','due','status'].includes(action))return;
+  if(action==='priority' && !['high','mid','low'].includes(value)){toast('Выберите приоритет');return;}
+  if(action==='status' && !tSt().some(x=>x.id===value)){toast('Выберите статус');return;}
+  if(action==='due' && value && (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(parseD(value).getTime()) || ymd(parseD(value))!==value)){toast('Некорректная дата');return;}
+  const count=chosen.length;
+  if(!window.confirm('Изменить '+count+' задач?'))return;
+  const ids=new Set(chosen.map(t=>t.id));
+  if(commit(()=>{
+    // One atomic application through the existing durable save queue.
+    for(const t of D.tasks){
+      if(!ids.has(t.id))continue;
+      if(action==='priority'){t.priority=value;t.updatedAt=Date.now();}
+      else if(action==='due'){t.due=value;t.updatedAt=Date.now();}
+      else setOverall(t,value);
+    }
+  })){
+    EXT_BULK.clear();
+    toast('Изменения '+count+' задач поставлены в очередь сохранения');
+  }
+}
+/* v3.2: pagination is UI-only; no database schema or saved settings change. */
+const PAGE_SIZE_SEARCH=60, PAGE_SIZE_JOURNAL=80, PAGE_SIZE_ARCHIVE=60, PAGE_SIZE_TRASH=80, PAGE_SIZE_SUBS=80;
+const PAGE_STATE={search:0,journal:0,archive:0,trash:0,subs:0,searchSignature:'',journalSignature:'',archiveSignature:'',trashSignature:'',subsSignature:''};
+function pageWindow(items, kind, size, signature){
+  const sigKey=kind+'Signature';
+  if(PAGE_STATE[sigKey]!==signature){PAGE_STATE[kind]=0;PAGE_STATE[sigKey]=signature;}
+  const count=Math.max(1,Math.ceil(items.length/size));
+  PAGE_STATE[kind]=Math.max(0,Math.min(PAGE_STATE[kind],count-1));
+  const current=PAGE_STATE[kind];
+  return {items:items.slice(current*size,(current+1)*size),current,count,total:items.length};
+}
+function pageControls(p,kind){
+  if(p.count<=1)return '';
+  return '<nav class="ext-pages" aria-label="Страницы результатов"><button type="button" class="btn sm" data-a="page-prev" data-kind="'+kind+'" '+(p.current===0?'disabled':'')+'>Назад</button><span class="hint">Страница '+(p.current+1)+' из '+p.count+' · всего '+p.total+'</span><button type="button" class="btn sm" data-a="page-next" data-kind="'+kind+'" '+(p.current===p.count-1?'disabled':'')+'>Далее</button></nav>';
+}
+function changePage(kind,delta){
+  if(!['search','journal','archive','trash','subs'].includes(kind))return;
+  PAGE_STATE[kind]=Math.max(0,PAGE_STATE[kind]+delta);
+  render();
+  const main=document.getElementById('main');
+  if(main)main.scrollIntoView({block:'start'});
+}
 function viewSearch2(){
-  const tasks=D.tasks.filter(extTaskMatches).sort(urgencySort);
+  const tasks=D.tasks.filter(extTaskMatches).sort(urgencySortFast);
+  const page=pageWindow(tasks,'search',PAGE_SIZE_SEARCH,JSON.stringify([EXT.q,EXT.status,EXT.priority,EXT.scope]));
   const q=EXT.q.trim().toLocaleLowerCase('ru');
   const extra=q ? D.journal.filter(j=>JSON.stringify(j).toLocaleLowerCase('ru').includes(q)).slice(0,30) : [];
   return '<div class="ext-panel"><h2>Поиск по задачам и журналу</h2>'+extInput('ext-q','Запрос',EXT.q)
     +'<div class="ext-filters"><label>Состояние<select id="ext-status">'+[['all','Все'],['active','Активные'],['done','Выполненные'],['overdue','Просроченные']].map(x=>'<option value="'+x[0]+'"'+(EXT.status===x[0]?' selected':'')+'>'+x[1]+'</option>').join('')+'</select></label>'
     +'<label>Приоритет<select id="ext-priority">'+[['all','Любой'],['high','Высокий'],['mid','Обычный'],['low','Низкий']].map(x=>'<option value="'+x[0]+'"'+(EXT.priority===x[0]?' selected':'')+'>'+x[1]+'</option>').join('')+'</select></label>'
-    +'<label>Тип<select id="ext-scope">'+[['all','Все'],['mine','Личные'],['orders','Указания']].map(x=>'<option value="'+x[0]+'"'+(EXT.scope===x[0]?' selected':'')+'>'+x[1]+'</option>').join('')+'</select></label></div></div>'
+    +'<label>Тип<select id="ext-scope">'+[['all','Все'],['mine','Личные'],['orders','Указания']].map(x=>'<option value="'+x[0]+'"'+(EXT.scope===x[0]?' selected':'')+'>'+x[1]+'</option>').join('')+'</select></label></div><div class="btn-row" style="margin-top:12px"><button type="button" class="btn sm" data-a="ext-filter-save">'+ic('plus',16)+'Сохранить фильтр</button><button type="button" class="btn sm" data-a="ext-filter-reset">Сбросить</button></div>'
+    +(extSavedFilters().length?'<div class="ext-saved"><p class="hint">Сохранённые фильтры</p>'+extSavedFilters().map(x=>'<div class="ext-saved-row"><button type="button" class="btn sm" data-a="ext-filter-load" data-id="'+esc(x.id)+'">'+esc(x.name)+'</button><button type="button" class="icon-btn" data-a="ext-filter-delete" data-id="'+esc(x.id)+'" aria-label="Удалить фильтр" title="Удалить фильтр">'+ic('x',16)+'</button></div>').join('')+'</div>':'')+'</div>'
     +'<section class="sec"><div class="sec-h"><h2>Задачи</h2><span class="n">'+tasks.length+'</span></div>'
-    +(tasks.length?'<div class="list grid2">'+tasks.slice(0,150).map(t=>taskCard(t,{compact:true})).join('')+'</div>':'<p class="hint">Совпадений нет.</p>')
-    +(tasks.length>150?'<p class="hint">Показаны первые 150 результатов. Уточните запрос.</p>':'')+'</section>'
+    +(tasks.length?'<div class="ext-bulk-bar"><button type="button" class="btn sm" data-a="ext-bulk-all">Выбрать показанные</button><button type="button" class="btn sm" data-a="ext-bulk-clear">Снять выбор</button><span class="hint">Выбрано: '+page.items.filter(t=>EXT_BULK.has(t.id)&&!t.archived).length+'</span></div>'
+      +'<div class="ext-bulk-controls"><label>Действие<select id="ext-bulk-action"><option value="priority">Приоритет</option><option value="due">Срок</option><option value="status">Статус</option></select></label><label>Значение<span id="ext-bulk-value-host"><select id="ext-bulk-value"><option value="high">Высокий</option><option value="mid">Обычный</option><option value="low">Низкий</option></select></span></label><button type="button" class="btn sm primary" data-a="ext-bulk-apply">Применить</button></div>'
+      +'<div class="list grid2">'+page.items.map(t=>'<div class="ext-bulk-item"><label class="ext-bulk-pick"><input type="checkbox" data-change="ext-bulk-check" data-id="'+esc(t.id)+'" '+(EXT_BULK.has(t.id)?'checked ':'')+(t.archived?'disabled ':'')+'aria-label="Выбрать задачу: '+esc(t.title)+'"> Выбрать</label>'+taskCard(t,{compact:true})+'</div>').join('')+'</div>':'<p class="hint">Совпадений нет.</p>')
+    +pageControls(page,'search')+'</section>'
     +(extra.length?'<section class="sec"><div class="sec-h"><h2>Журнал</h2><span class="n">'+extra.length+'</span></div><div class="rows">'+extra.map(j=>'<div class="row" data-open="j" data-id="'+esc(j.id)+'"><div class="main"><div class="ttl">'+esc(j.brief||j.title||j.number||'Запись')+'</div><div class="sub">'+esc(j.date||'')+'</div></div></div>').join('')+'</div></section>':'');
 }
+// Analytics uses the existing task fields only; no schema migration or network requests.
+function analyticsSnapshot(period, tasks, reference){
+  const days=[7,30,90].includes(Number(period))?Number(period):30;
+  const end=new Date(reference.getFullYear(),reference.getMonth(),reference.getDate());
+  const start=new Date(end); start.setDate(start.getDate()-days+1);
+  const startMs=start.getTime(), endMs=end.getTime()+864e5;
+  const completed=tasks.filter(t=>Number.isFinite(Number(t.completedAt)) && Number(t.completedAt)>=startMs && Number(t.completedAt)<endMs);
+  // Aggregate completions once instead of scanning all completed tasks for each day.
+  // Local calendar dates are used to remain correct across DST transitions.
+  const completedByDay=new Map();
+  for(const t of completed){
+    const key=ymd(new Date(Number(t.completedAt)));
+    completedByDay.set(key,(completedByDay.get(key)||0)+1);
+  }
+  const bins=[];
+  for(let i=0;i<days;i++){
+    const d=new Date(start); d.setDate(start.getDate()+i);
+    const key=ymd(d);
+    bins.push({day:key,count:completedByDay.get(key)||0});
+  }
+  const active=tasks.filter(t=>!t.archived&&!isDone(t));
+  const overdue=active.filter(t=>!!t.due&&t.due<ymd(end));
+  const byAssignee=new Map();
+  active.forEach(t=>(t.assignees||[]).forEach(a=>{
+    if(!a||!a.name||aDone(a.status)) return;
+    const name=String(a.name).trim(); if(!name) return;
+    const item=byAssignee.get(name)||{name,count:0,overdue:0};
+    item.count++; if(t.due&&t.due<ymd(end)) item.overdue++;
+    byAssignee.set(name,item);
+  }));
+  const statusCounts=new Map();
+  for(const t of tasks){if(!t.archived) statusCounts.set(t.status,(statusCounts.get(t.status)||0)+1);}
+  return {days,completed:completed.length,bins,active:active.length,overdue:overdue.length,
+    assignees:[...byAssignee.values()].sort((a,b)=>b.count-a.count||a.name.localeCompare(b.name,'ru')),
+    groups:tSt().map(st=>({label:st.name,count:statusCounts.get(st.id)||0,color:st.color})),
+    nearest:active.filter(t=>t.due).sort((a,b)=>a.due.localeCompare(b.due)).slice(0,12)};
+}
 function viewAnalytics2(){
-  const all=D.tasks, active=all.filter(t=>!t.archived), done=all.filter(t=>isDone(t)), overdue=active.filter(isOverdue);
-  const now=Date.now(), week=7*864e5;
-  const recent=all.filter(t=>t.completedAt && t.completedAt>=now-week);
-  const groups=tSt().map(s=>({label:s.name, count:active.filter(t=>t.status===s.id).length, color:s.color}));
-  const max=Math.max(1,...groups.map(g=>g.count));
-  return '<div class="ext-metrics">'+[['Всего задач',all.length],['Активные',active.filter(t=>!isDone(t)).length],['Просроченные',overdue.length],['Выполнено за 7 дней',recent.length]].map(x=>'<div class="ext-metric"><strong>'+x[1]+'</strong><span>'+x[0]+'</span></div>').join('')+'</div>'
-    +'<section class="sec"><div class="sec-h"><h2>Распределение по статусам</h2></div><div class="ext-panel">'+groups.map(g=>'<div class="ext-stat"><span>'+esc(g.label)+'</span><div class="ext-track"><i style="width:'+(100*g.count/max)+'%;background:'+esc(g.color||'#56688A')+'"></i></div><b>'+g.count+'</b></div>').join('')+'</div></section>'
-    +'<section class="sec"><div class="sec-h"><h2>Ближайшие сроки</h2></div><div class="list grid2">'+active.filter(t=>t.due&&!isDone(t)).sort((a,b)=>a.due.localeCompare(b.due)).slice(0,12).map(t=>taskCard(t,{compact:true})).join('')+'</div></section>';
+  const report=analyticsSnapshot(EXT.period,D.tasks,new Date());
+  const max=Math.max(1,...report.groups.map(g=>g.count));
+  const maxDaily=Math.max(1,...report.bins.map(b=>b.count));
+  const loadMax=Math.max(1,...report.assignees.map(a=>a.count));
+  return '<div class="ext-panel"><h2>Аналитика задач</h2><label class="ext-label" for="ext-period">Период выполнения</label><select id="ext-period" class="ext-period">'+[[7,'7 дней'],[30,'30 дней'],[90,'90 дней']].map(([n,label])=>'<option value="'+n+'"'+(report.days===n?' selected':'')+'>'+label+'</option>').join('')+'</select><p class="hint">Период применяется к завершениям; активные и просроченные задачи показаны на сегодня.</p></div>'
+    +'<div class="ext-metrics">'+[['Всего задач',D.tasks.length],['Активные',report.active],['Просроченные',report.overdue],['Завершено за '+report.days+' дней',report.completed]].map(x=>'<div class="ext-metric"><strong>'+x[1]+'</strong><span>'+x[0]+'</span></div>').join('')+'</div>'
+    +'<section class="sec"><div class="sec-h"><h2>Динамика завершений</h2></div><div class="ext-panel"><div class="ext-chart" role="img" aria-label="Завершено задач за период: '+report.completed+'">'+report.bins.map(b=>'<div class="ext-chart-col" title="'+b.day+': '+b.count+'"><i style="height:'+(b.count?Math.max(5,100*b.count/maxDaily):0)+'%"></i></div>').join('')+'</div><div class="ext-chart-axis"><span>'+esc(fmtDateShort(report.bins[0].day))+'</span><span>'+esc(fmtDateShort(report.bins[report.bins.length-1].day))+'</span></div></div></section>'
+    +'<section class="sec"><div class="sec-h"><h2>Распределение по статусам</h2></div><div class="ext-panel">'+report.groups.map(g=>'<div class="ext-stat"><span>'+esc(g.label)+'</span><div class="ext-track"><i style="width:'+(100*g.count/max)+'%;background:'+esc(g.color||'#56688A')+'"></i></div><b>'+g.count+'</b></div>').join('')+'</div></section>'
+    +'<section class="sec"><div class="sec-h"><h2>Нагрузка по исполнителям</h2></div><div class="ext-panel">'+(report.assignees.length?report.assignees.slice(0,30).map(a=>'<div class="ext-stat"><span title="'+esc(a.name)+'">'+esc(a.name)+'</span><div class="ext-track"><i style="width:'+(100*a.count/loadMax)+'%"></i></div><b title="Просрочено: '+a.overdue+'">'+a.count+(a.overdue?' / '+a.overdue+' !':'')+'</b></div>').join(''):'<p class="hint">Нет незавершённых поручений исполнителям.</p>')+(report.assignees.length>30?'<p class="hint">Показаны первые 30 исполнителей.</p>':'')+'<p class="hint">Число справа — открытые поручения; после косой черты — просроченные.</p></div></section>'
+    +'<section class="sec"><div class="sec-h"><h2>Ближайшие сроки</h2></div>'+(report.nearest.length?'<div class="list grid2">'+report.nearest.map(t=>taskCard(t,{compact:true})).join('')+'</div>':'<p class="hint">Нет активных задач со сроком.</p>')+'</section>';
+}
+function fmtDateShort(s){return parseD(s).toLocaleDateString('ru-RU',{day:'numeric',month:'short'});}
+function upcomingRepeats(limit=20){
+  return activeTasks().filter(t=>t.repeat && t.repeat!=='none' && !isDone(t))
+    .map(t=>({task:t, next:t.due || today(), cadence: (REPEATS.find(x=>x[0]===t.repeat)||[])[1] || t.repeat}))
+    .filter(x=>/^\d{4}-\d{2}-\d{2}$/.test(x.next))
+    .sort((a,b)=>a.next.localeCompare(b.next)).slice(0,limit);
 }
 function viewPlanner2(){
   const start=parseD(today()), days=[];
-  for(let i=0;i<14;i++){const d=new Date(start);d.setDate(d.getDate()+i);const key=ymd(d);days.push({date:key,tasks:activeTasks().filter(t=>t.due===key).sort(urgencySort)});}
-  const missing=activeTasks().filter(t=>!t.due&&!isDone(t));
-  return '<div class="ext-panel"><h2>План на 14 дней</h2><p class="hint">Задачи сгруппированы по сроку. Для изменения даты откройте карточку.</p><button class="btn sm" data-a="tab" data-tab="cal">'+ic('cal',16)+'Открыть календарь</button></div>'
+  const tasks=activeTasks(), byDue=new Map(), missing=[];
+  for(const t of tasks){
+    if(!t.due){if(!isDone(t)) missing.push(t);continue;}
+    if(!byDue.has(t.due)) byDue.set(t.due,[]);
+    byDue.get(t.due).push(t);
+  }
+  for(let i=0;i<14;i++){
+    const d=new Date(start);d.setDate(d.getDate()+i);
+    const key=ymd(d);
+    days.push({date:key,tasks:(byDue.get(key)||[]).sort(urgencySortFast)});
+  }
+  const repeats=upcomingRepeats();
+  const repeatPanel='<section class="sec"><div class="sec-h"><h2>Повторяющиеся задачи</h2><span class="n">'+repeats.length+'</span></div>'
+    +(repeats.length?'<div class="ext-panel">'+repeats.map(x=>'<div class="ext-stat"><span>'+esc(x.task.title)+'</span><b>'+esc(fmtFull(x.next))+' · '+esc(x.cadence)+'</b></div>').join('')+'</div>':'<p class="hint">Нет активных повторяющихся задач.</p>')
+    +'<p class="hint">Следующая задача создаётся при завершении текущей. Повторы заранее не создаются.</p></section>';
+  return repeatPanel+'<div class="ext-panel"><h2>План на 14 дней</h2><p class="hint">Задачи сгруппированы по сроку. Для изменения даты откройте карточку.</p><button class="btn sm" data-a="tab" data-tab="cal">'+ic('cal',16)+'Открыть календарь</button></div>'
     +days.map(d=>'<section class="sec"><div class="sec-h"><h2>'+esc(parseD(d.date).toLocaleDateString('ru-RU',{weekday:'short',day:'numeric',month:'long'}))+'</h2><span class="n">'+d.tasks.length+'</span><span class="sp"></span><button class="btn sm" data-a="ext-new-day" data-day="'+d.date+'">'+ic('plus',16)+'</button></div>'+(d.tasks.length?'<div class="list grid2">'+d.tasks.map(t=>taskCard(t,{compact:true})).join('')+'</div>':'<p class="hint">Нет задач</p>')+'</section>').join('')
     +'<section class="sec"><div class="sec-h"><h2>Без срока</h2><span class="n">'+missing.length+'</span></div>'+(missing.length?'<div class="list grid2">'+missing.slice(0,30).map(t=>taskCard(t,{compact:true})).join('')+'</div>':'')+'</section>';
 }
 function viewBackup2(){
   return '<div class="ext-panel"><h2>Резервирование и перенос данных</h2><p class="hint">Выгрузка содержит всю базу. Для переноса на другое устройство сохраните JSON и импортируйте его там. Облачная синхронизация не используется.</p>'
   +'<div class="btn-row"><button class="btn primary" data-a="ext-backup">'+ic('download',18)+'Создать резервную копию</button><label class="btn" style="cursor:pointer">'+ic('upload',18)+'Восстановить из JSON<input id="ext-import" type="file" accept=".json,application/json" hidden></label></div>'
-  +'<p class="hint">Последняя подтверждённая выгрузка: '+esc(D.settings.lastBackup?fmtDT(D.settings.lastBackup):'нет данных')+'. Перед восстановлением создайте копию текущей базы. Импорт полностью заменяет локальные данные после подтверждения.</p></div>';
+  +'<p class="hint">Последняя подтверждённая выгрузка: '+esc(D.settings.lastBackup?fmtDT(D.settings.lastBackup):'нет данных')+'. Перед восстановлением создайте копию текущей базы. Импорт полностью заменяет локальные данные после подтверждения.</p></div>'
+  +'<section class="sec"><div class="sec-h"><h2>История выгрузок</h2></div><div class="ext-panel">'
+  +((Array.isArray(D.settings.backupHistory)?D.settings.backupHistory:[]).length
+    ?D.settings.backupHistory.map(x=>'<div class="ext-stat"><span>'+esc(fmtDT(x.at))+'</span><b>'+(x.encrypted?'С паролем':'Без пароля')+'</b></div>').join('')
+    :'<p class="hint">История пока пуста.</p>')
+  +'<p class="hint">Это журнал выполненных выгрузок, а не хранилище файлов. Для восстановления необходим ранее сохранённый JSON-файл. История хранится в базе и входит в экспорт.</p></div></section>';
 }
 
 const VIEWS = {ext_search:viewSearch2,ext_analytics:viewAnalytics2,ext_planner:viewPlanner2,ext_backup:viewBackup2,trash:viewTrash, dash:viewDash, mine:viewMine, orders:viewOrders, cal:viewCal, boards:viewBoards, subs:viewSubs, journal:viewJournal, archive:viewArchive};
+let PREVIOUS_RENDER_TAB=null;
+// Avoid replacing unchanged DOM subtrees: preserves focus, event handlers and scroll.
+// The view HTML is still calculated on each call; this is a conservative DOM optimization.
+function replaceIfChanged(node, html){
+  if (!node || node.innerHTML === html) return false;
+  node.innerHTML = html;
+  return true;
+}
+// v3.7: reconcile board DOM in place. Keep stable card nodes by their data IDs.
+// Restrict this to the boards view: forms and other views retain their existing renderer.
+function boardNodeKey(node){
+  if(node.nodeType!==1)return null;
+  if(node.matches('.cards > [data-open][data-id]'))return 'card:'+node.dataset.open+':'+node.dataset.id;
+  return null;
+}
+function reconcileBoardNode(oldNode,newNode){
+  if(newNode.nodeType===11 && oldNode.nodeType===1){
+    const fresh=Array.from(newNode.childNodes);
+    for(let i=0;i<fresh.length;i++){
+      if(oldNode.childNodes[i])reconcileBoardNode(oldNode.childNodes[i],fresh[i]);
+      else oldNode.appendChild(fresh[i].cloneNode(true));
+    }
+    while(oldNode.childNodes.length>fresh.length)oldNode.lastChild.remove();
+    return;
+  }
+  if(oldNode.nodeType!==newNode.nodeType || (oldNode.nodeType===1 && oldNode.tagName!==newNode.tagName)){
+    oldNode.replaceWith(newNode.cloneNode(true));return;
+  }
+  if(oldNode.nodeType===3){if(oldNode.nodeValue!==newNode.nodeValue)oldNode.nodeValue=newNode.nodeValue;return;}
+  if(oldNode.nodeType!==1)return;
+  if(oldNode.isEqualNode(newNode))return;
+  for(const a of Array.from(oldNode.attributes))if(!newNode.hasAttribute(a.name))oldNode.removeAttribute(a.name);
+  for(const a of Array.from(newNode.attributes))if(oldNode.getAttribute(a.name)!==a.value)oldNode.setAttribute(a.name,a.value);
+  // Card lists use stable keys, so reordering does not destroy unchanged cards.
+  if(oldNode.classList.contains('cards') && newNode.classList.contains('cards')){
+    const keyed=new Map();
+    for(const child of oldNode.children){const key=boardNodeKey(child);if(key)keyed.set(key,child);}
+    let cursor=oldNode.firstChild;
+    for(const fresh of Array.from(newNode.childNodes)){
+      const key=boardNodeKey(fresh);
+      const existing=(key && keyed.get(key)) || (key ? null : (cursor && !boardNodeKey(cursor) ? cursor : null));
+      if(existing){
+        if(existing!==cursor)oldNode.insertBefore(existing,cursor);
+        reconcileBoardNode(existing,fresh);
+        cursor=existing.nextSibling;
+        if(key)keyed.delete(key);
+      }else{
+        const created=fresh.cloneNode(true);oldNode.insertBefore(created,cursor);
+      }
+    }
+    while(cursor){const next=cursor.nextSibling;cursor.remove();cursor=next;}
+    return;
+  }
+  const freshChildren=Array.from(newNode.childNodes);
+  for(let i=0;i<freshChildren.length;i++){
+    const old=oldNode.childNodes[i];
+    if(!old){oldNode.appendChild(freshChildren[i].cloneNode(true));continue;}
+    reconcileBoardNode(old,freshChildren[i]);
+  }
+  while(oldNode.childNodes.length>freshChildren.length)oldNode.lastChild.remove();
+}
+function replaceBoardIfChanged(node,html){
+  if(!node || node.innerHTML===html)return false;
+  const template=document.createElement('template');template.innerHTML=html;
+  // The DOM reconciliation is intentionally limited to the same selected board.
+  const oldBoard=node.querySelector('.board-scroll[data-key]');
+  const newBoard=template.content.querySelector('.board-scroll[data-key]');
+  if(!oldBoard || !newBoard || oldBoard.dataset.key!==newBoard.dataset.key){node.innerHTML=html;return true;}
+  reconcileBoardNode(node,template.content);
+  return true;
+}
+// v3.8: keyed reconciliation for task lists and search results. The existing
+// renderer remains the fallback when the layout changes between render passes.
+function taskListNodeKey(node){
+  if(node.nodeType!==1)return null;
+  if(node.matches('.card[data-open="task"][data-id]'))return 'task:'+node.dataset.id;
+  if(node.matches('.ext-bulk-item')){
+    const card=node.querySelector('.card[data-open="task"][data-id]');
+    return card?'bulk:'+card.dataset.id:null;
+  }
+  return null;
+}
+function reconcileTaskListNode(oldNode,newNode){
+  if(newNode.nodeType===11 && oldNode.nodeType===1){
+    const fresh=Array.from(newNode.childNodes);
+    for(let i=0;i<fresh.length;i++){
+      if(oldNode.childNodes[i])reconcileTaskListNode(oldNode.childNodes[i],fresh[i]);
+      else oldNode.appendChild(fresh[i].cloneNode(true));
+    }
+    while(oldNode.childNodes.length>fresh.length)oldNode.lastChild.remove();
+    return;
+  }
+  if(oldNode.nodeType!==newNode.nodeType || (oldNode.nodeType===1 && oldNode.tagName!==newNode.tagName)){
+    oldNode.replaceWith(newNode.cloneNode(true));return;
+  }
+  if(oldNode.nodeType===3){if(oldNode.nodeValue!==newNode.nodeValue)oldNode.nodeValue=newNode.nodeValue;return;}
+  if(oldNode.nodeType!==1 || oldNode.isEqualNode(newNode))return;
+  for(const a of Array.from(oldNode.attributes))if(!newNode.hasAttribute(a.name))oldNode.removeAttribute(a.name);
+  for(const a of Array.from(newNode.attributes))if(oldNode.getAttribute(a.name)!==a.value)oldNode.setAttribute(a.name,a.value);
+  if(oldNode.matches('.list.grid2') && newNode.matches('.list.grid2')){
+    const previous=new Map();
+    for(const child of oldNode.children){const k=taskListNodeKey(child);if(k)previous.set(k,child);}
+    const fragment=document.createDocumentFragment();
+    for(const fresh of Array.from(newNode.children)){
+      const key=taskListNodeKey(fresh), existing=key?previous.get(key):null;
+      if(existing){reconcileTaskListNode(existing,fresh);fragment.appendChild(existing);previous.delete(key);}
+      else fragment.appendChild(fresh.cloneNode(true));
+    }
+    oldNode.replaceChildren(fragment);
+    return;
+  }
+  const freshChildren=Array.from(newNode.childNodes);
+  for(let i=0;i<freshChildren.length;i++){
+    const current=oldNode.childNodes[i];
+    if(current)reconcileTaskListNode(current,freshChildren[i]);
+    else oldNode.appendChild(freshChildren[i].cloneNode(true));
+  }
+  while(oldNode.childNodes.length>freshChildren.length)oldNode.lastChild.remove();
+  // Keep native checkbox state in sync when a search result is selected.
+  if(oldNode.matches('input[type="checkbox"]'))oldNode.checked=newNode.checked;
+}
+function replaceTaskListsIfChanged(node,html){
+  if(!node || node.innerHTML===html)return false;
+  const template=document.createElement('template');template.innerHTML=html;
+  const oldLists=Array.from(node.querySelectorAll('.list.grid2'));
+  const newLists=Array.from(template.content.querySelectorAll('.list.grid2'));
+  const sameShape=oldLists.length===newLists.length && oldLists.length>0
+    && oldLists.every((list,i)=>list.parentElement?.tagName===newLists[i].parentElement?.tagName);
+  if(!sameShape){node.innerHTML=html;return true;}
+  reconcileTaskListNode(node,template.content);
+  return true;
+}
+// Локальная диагностика: только агрегированные счётчики, без содержимого задач и PIN.
+const PERF_DIAG={renders:0,totalMs:0,maxMs:0,errors:0,lastErrorAt:0};
+window.addEventListener('error',()=>{PERF_DIAG.errors++;PERF_DIAG.lastErrorAt=Date.now();});
+window.addEventListener('unhandledrejection',()=>{PERF_DIAG.errors++;PERF_DIAG.lastErrorAt=Date.now();});
+function showDiagnostics(){
+  const avg=PERF_DIAG.renders ? (PERF_DIAG.totalMs/PERF_DIAG.renders).toFixed(1) : '—';
+  const heap=performance.memory && Number.isFinite(performance.memory.usedJSHeapSize)
+    ? Math.round(performance.memory.usedJSHeapSize/1048576)+' МБ (приблизительно)' : 'Не поддерживается браузером';
+  const html=head('Диагностика')+'<div class="sh-b"><p class="hint">Показатели только текущего запуска, не передаются в сеть. Время включает формирование и обновление интерфейса.</p>'
+    +'<div class="set-line"><span>Перерисовок</span><strong>'+PERF_DIAG.renders+'</strong></div>'
+    +'<div class="set-line"><span>Среднее время</span><strong>'+avg+' мс</strong></div>'
+    +'<div class="set-line"><span>Максимальное время</span><strong>'+PERF_DIAG.maxMs.toFixed(1)+' мс</strong></div>'
+    +'<div class="set-line"><span>Ошибок JavaScript</span><strong>'+PERF_DIAG.errors+'</strong></div>'
+    +'<div class="set-line"><span>Память JavaScript</span><strong>'+heap+'</strong></div>'
+    +'</div><div class="sh-f"><button class="btn primary" type="button" data-close>Закрыть</button></div>';
+  openSheet(html,{small:true});
+}
 function render(){
+  const diagStart=performance.now();
+  SEARCH_TEXT_CACHE = new WeakMap();
+  URGENCY_KEY_CACHE = new WeakMap();
   applyTheme();
+  const mainNode=$('#main');
+  const previousScroll=mainNode ? mainNode.scrollTop : 0;
+  const sameTab=PREVIOUS_RENDER_TAB===U.tab;
+  PREVIOUS_RENDER_TAB=U.tab;
   const ae = document.activeElement;
   const fid = ae && ae.id && ae.closest && ae.closest('#main') ? ae.id : null;
   const caret = fid && typeof ae.selectionStart === 'number' ? ae.selectionStart : null;
   const keep = $$('.board-scroll').map(e => [e.dataset.key, e.scrollLeft]);
-  $('#side').innerHTML = sideHtml();
-  $('#tabbar').innerHTML = tabbarHtml();
-  $('#top').innerHTML = topHtml();
-  $('#main').innerHTML = (VIEWS[U.tab] || viewDash)();
-  keep.forEach(k => { const el = $('.board-scroll[data-key="'+k[0]+'"]'); if (el) el.scrollLeft = k[1]; });
-  if (fid) { const el = document.getElementById(fid); if (el) { el.focus(); if (caret != null) { try { el.setSelectionRange(caret, caret); } catch (e) {} } } }
+  replaceIfChanged($('#side'), sideHtml());
+  replaceIfChanged($('#tabbar'), tabbarHtml());
+  replaceIfChanged($('#top'), topHtml());
+  const mainHtml=(VIEWS[U.tab] || viewDash)();
+  const mainChanged = U.tab==='boards' && sameTab ? replaceBoardIfChanged(mainNode,mainHtml) : (sameTab && ['mine','orders','ext_search'].includes(U.tab) ? replaceTaskListsIfChanged(mainNode,mainHtml) : replaceIfChanged(mainNode,mainHtml));
+  if(mainChanged){
+    if(sameTab && mainNode && mainNode.scrollTop !== previousScroll) mainNode.scrollTop=previousScroll;
+    keep.forEach(k => { const el = $('.board-scroll[data-key="'+k[0]+'"]'); if (el) el.scrollLeft = k[1]; });
+    if (fid) { const el = document.getElementById(fid); if (el) { el.focus(); if (caret != null) { try { el.setSelectionRange(caret, caret); } catch (e) {} } } }
+  }
   const fab = $('#fab');
   const fabFor = {dash:'Задача', mine:'Задача', orders:'Указание', cal:'Задача'};
-  if (fabFor[U.tab]) { fab.hidden = false; fab.innerHTML = ic('plus', 22) + fabFor[U.tab]; } else fab.hidden = true;
+  if (fabFor[U.tab]) {
+    fab.hidden = false;
+    const fabHtml=ic('plus', 22) + fabFor[U.tab];
+    replaceIfChanged(fab, fabHtml);
+  } else fab.hidden = true;
   $('#fab-v').hidden = !fabFor[U.tab];
+  const diagMs=performance.now()-diagStart;
+  PERF_DIAG.renders++;PERF_DIAG.totalMs+=diagMs;PERF_DIAG.maxMs=Math.max(PERF_DIAG.maxMs,diagMs);
 }
 
 /* ================= форма задачи ================= */
@@ -1593,7 +2002,7 @@ async function exportXlsx(name, sheet, headRow, rows, widths){
   await saveFile(name + '_' + today() + '.xlsx', blob);
 }
 function exportTasks(){
-  const rows = activeTasks().slice().sort(urgencySort).map(t => [
+  const rows = activeTasks().slice().sort(urgencySortFast).map(t => [
     hasAsg(t) ? 'Указание' : 'Моя', t.title, t.note || '', (t.assignees || []).map(a => a.name + ' — ' + aStatus(a.status).name).join('; '),
     fmtFull(t.due || ''), prName(t.priority), tStatus(t.status).name,
     (t.checklist || []).length ? t.checklist.filter(i => i.done).length + '/' + t.checklist.length : '',
@@ -1611,8 +2020,17 @@ function exportBoard(){
     exportXlsx('doska', b.title.slice(0, 30), ['ФИО','Столбец','Награда','Имеющиеся награды'], D.people.slice().sort(byOrder).map(p => [p.fio, (cols.find(c => c.id === (ids.has(p.col) ? p.col : 'c_staff')) || {}).title || '', p.award || '', p.existing || '']), [34,18,30,34]);
   } else exportXlsx('doska', b.title.slice(0, 30), ['Заголовок','Столбец','Заметка','Примечание'], D.bcards.filter(c => c.board === b.id).sort(byOrder).map(c => [c.title, ((b.cols || []).find(x => x.id === c.col) || {}).title || '', c.note || '', c.remark || '']), [36,18,44,36]);
 }
+// v2.7: export audit trail; records file creation, not the file contents.
+function noteBackupExport(encrypted){
+  return commit(()=>{
+    const entries=Array.isArray(D.settings.backupHistory)?D.settings.backupHistory:[];
+    D.settings.backupHistory=[{id:uid(),at:Date.now(),encrypted:!!encrypted},...entries].slice(0,30);
+    D.settings.lastBackup=Date.now();
+  });
+}
 function backup(){
   if (SEC.decoy) return;
+  if (PENDING_WRITES || STORAGE_READONLY || !STORAGE_OK || SEC.locked) { toast('Дождитесь завершения сохранения перед выгрузкой'); return; }
   const sh = openSheet(head('Выгрузить данные') + '<div class="sh-b">'
     + '<p class="hint" style="margin:0">Задайте пароль на файл — без него данные из файла не прочитать. Пароль понадобится при загрузке на другом устройстве, восстановить его нельзя.</p>'
     + '<label class="fld"><span class="lbl">Пароль на файл</span><input type="password" id="bk-p1" autocomplete="new-password" placeholder="Не короче 4 символов"></label>'
@@ -1624,10 +2042,10 @@ function backup(){
   $('#bk-plain', sh).addEventListener('click', async () => {
     if (!(await confirmDlg('Файл без пароля может прочитать любой, к кому он попадёт. Выгрузить без пароля?', 'Выгрузить'))) return;
     const data = new Blob([JSON.stringify(D, null, 1)], {type:'application/json'});
-    const ok = await saveFile(name, data); if (ok) { if (ok === true) { commit(() => { D.settings.lastBackup = Date.now(); }); } closeSheet(); }
+    const ok = await saveFile(name, data); if (ok) { if (ok === true) { noteBackupExport(false); } closeSheet(); }
   });
   $('#bk-go', sh).addEventListener('click', async e => {
-    if (blob) { const ok = await saveFile(name, blob); if (ok) { if (ok === true) { commit(() => { D.settings.lastBackup = Date.now(); }); } closeSheet(); } return; }
+    if (blob) { const ok = await saveFile(name, blob); if (ok) { if (ok === true) { noteBackupExport(true); } closeSheet(); } return; }
     const p1 = $('#bk-p1', sh).value, p2 = $('#bk-p2', sh).value;
     if (p1.length < 4) { toast('Пароль — не короче 4 символов'); $('#bk-p1', sh).focus(); return; }
     if (p1 !== p2) { toast('Пароли не совпадают'); $('#bk-p2', sh).focus(); return; }
@@ -1661,7 +2079,9 @@ function askFilePassword(env, done){
   setTimeout(() => $('#fp-p', sh).focus(), 80);
 }
 function restoreFrom(file){
+  if (!file || file.size > 50 * 1024 * 1024) { toast('Файл слишком большой (максимум 50 МБ)'); return; }
   const r = new FileReader();
+  r.onerror = () => toast('Не удалось прочитать файл резервной копии');
   r.onload = () => {
     let d; try { d = JSON.parse(r.result); } catch (e) { toast('Файл не читается: это не файл данных СКиПП'); return; }
     const apply = async d => {
@@ -1701,6 +2121,7 @@ function settingsGroupHtml(g){
     + (SEC.decoy ? '' : '<div class="btn-row">' + (pinSet() ? '<button type="button" class="btn sm" data-s="pin-set">Сменить код</button><button type="button" class="btn sm danger-o" data-s="alarm">Тревога'+(auxRec() ? ' (вкл.)' : '')+'</button><button type="button" class="btn sm danger-o" data-s="pin-off">Выключить код</button>' : '<button type="button" class="btn sm primary" data-s="pin-set">Включить код-пароль</button>') + '</div>');
   if (g === 'data') return (SEC.decoy ? '' : '<p style="margin:0">Всё хранится только на этом устройстве и никуда не отправляется. Чтобы перенести задачи на другое устройство, выгрузите файл, передайте его любым способом (Telegram, почта, AirDrop) и загрузите там.</p>'
     + '<div class="btn-row"><button type="button" class="btn sm" data-s="backup">'+ic('download', 16)+'Выгрузить данные</button><label class="btn sm" style="cursor:pointer">'+ic('upload', 16)+'Загрузить данные<input type="file" id="st-file" accept=".json,application/json" hidden></label><button type="button" class="btn sm" data-s="xlsx">'+ic('download', 16)+'Задачи в Excel</button></div>'
+    + '<div class="btn-row"><button type="button" class="btn sm" id="skipp-diagnostics">Диагностика производительности</button></div>'
     + '<p class="hint" style="margin:0">Загрузка заменяет все данные на устройстве данными из файла.</p>')
     + '<div class="set-sec"><h3>Очистка</h3><div class="btn-row"><button type="button" class="btn sm danger-o" data-s="wipe">'+ic('trash', 16)+'Удалить все данные</button></div></div>';
   return '<p style="margin:0">Короткий обзор возможностей и тестовые задачи, чтобы всё попробовать.</p><div class="btn-row"><button type="button" class="btn sm" data-s="tour">Обучение</button>'
@@ -2571,8 +2992,18 @@ async function handle(a, el){
   const id = el.dataset.id;
   switch (a) {
     case 'tab': go(el.dataset.tab); break;
+    case 'board-more': {const key=el.dataset.boardKey;if(key && key.length<250){BOARD_VISIBLE.set(key,(BOARD_VISIBLE.get(key)||BOARD_BATCH)+BOARD_BATCH);render();}break;}
+    case 'page-prev': changePage(el.dataset.kind,-1); break;
+    case 'page-next': changePage(el.dataset.kind,1); break;
     case 'ext-new-day': openTaskForm(null,{task:{due:el.dataset.day}}); break;
     case 'ext-backup': backup(); break;
+    case 'ext-bulk-all': {const list=D.tasks.filter(extTaskMatches).sort(urgencySortFast); const page=pageWindow(list,'search',PAGE_SIZE_SEARCH,JSON.stringify([EXT.q,EXT.status,EXT.priority,EXT.scope])); page.items.forEach(t=>{if(!t.archived)EXT_BULK.add(t.id);});render();break;}
+    case 'ext-bulk-clear': EXT_BULK.clear();render();break;
+    case 'ext-bulk-apply': extBulkApply();break;
+    case 'ext-filter-save': extSaveFilter(); break;
+    case 'ext-filter-reset': extApplyFilter({}); render(); break;
+    case 'ext-filter-load': {const f=extSavedFilters().find(x=>x.id===id); if(f){extApplyFilter(f.filter);render();} break;}
+    case 'ext-filter-delete': extRemoveFilter(id); break;
     case 'more': openMore(); break;
     case 'settings': openSettings(); break;
     case 'undo': undo(); break;
@@ -2593,7 +3024,8 @@ async function handle(a, el){
     case 'asg': U.asg = el.dataset.name; render(); break;
     case 'asg-go': U.asg = el.dataset.name; U.search = ''; U.tab = 'orders'; saveUI(); render(); window.scrollTo(0, 0); break;
     case 'dash-settings': openDashSettings(); break;
-    case 'cal-prev': case 'cal-next': { const d = new Date(U.cal.y, U.cal.m + (a === 'cal-next' ? 1 : -1), 1); U.cal = {y:d.getFullYear(), m:d.getMonth()}; render(); break; }
+    case 'cal-prev': case 'cal-next': { const delta = a === 'cal-next' ? 1 : -1; if (U.calMode === 'week') { U.sel = addDays(U.sel, 7 * delta); const d = parseD(U.sel); U.cal = {y:d.getFullYear(),m:d.getMonth()}; } else { const d = new Date(U.cal.y, U.cal.m + delta, 1); U.cal = {y:d.getFullYear(), m:d.getMonth()}; } render(); break; }
+    case 'cal-mode': { U.calMode = U.calMode === 'week' ? 'month' : 'week'; const d = parseD(U.sel); if (U.calMode === 'week') U.cal = {y:d.getFullYear(),m:d.getMonth()}; render(); break; }
     case 'cal-today': { const d = new Date(); U.cal = {y:d.getFullYear(), m:d.getMonth()}; U.sel = today(); render(); break; }
     case 'pick-day': U.sel = el.dataset.day; { const d = parseD(U.sel); if (d.getMonth() !== U.cal.m) U.cal = {y:d.getFullYear(), m:d.getMonth()}; } render(); break;
     case 'add-task-day': openTaskForm(null, {task:{due:U.sel}}); break;
@@ -2633,7 +3065,23 @@ document.addEventListener('input', e => {
   else if (e.target.id === 'q-tasks') { U.search = e.target.value; render(); }
   else if (e.target.id === 'sub-q') { U.subQ = e.target.value; render(); }
 });
-document.addEventListener('change', e => { if(e.target.id==='ext-status'){EXT.status=e.target.value;render();} else if(e.target.id==='ext-priority'){EXT.priority=e.target.value;render();} else if(e.target.id==='ext-scope'){EXT.scope=e.target.value;render();} else if(e.target.id==='ext-import'){const f=e.target.files&&e.target.files[0];if(f)restoreFrom(f);}  if (e.target.dataset && e.target.dataset.change === 'j-sort') { U.jSort = e.target.value; render(); } });
+document.addEventListener('change', e => {
+  if(e.target.dataset?.change==='ext-bulk-check'){
+    if(e.target.checked)EXT_BULK.add(e.target.dataset.id);else EXT_BULK.delete(e.target.dataset.id);
+    const counter=document.querySelector('.ext-bulk-bar .hint');
+    if(counter)counter.textContent='Выбрано: '+extBulkSelection().filter(t=>pageWindow(D.tasks.filter(extTaskMatches).sort(urgencySortFast),'search',PAGE_SIZE_SEARCH,JSON.stringify([EXT.q,EXT.status,EXT.priority,EXT.scope])).items.some(x=>x.id===t.id)).length;
+    return;
+  }
+  if(e.target.id==='ext-bulk-action'){
+    const host=document.getElementById('ext-bulk-value-host');if(!host)return;
+    const kind=e.target.value;
+    if(kind==='due')host.innerHTML='<input type="date" id="ext-bulk-value" aria-label="Новый срок; пустое значение снимает срок">';
+    else if(kind==='status')host.innerHTML='<select id="ext-bulk-value">'+tSt().map(x=>'<option value="'+esc(x.id)+'">'+esc(x.name)+'</option>').join('')+'</select>';
+    else host.innerHTML='<select id="ext-bulk-value"><option value="high">Высокий</option><option value="mid">Обычный</option><option value="low">Низкий</option></select>';
+    return;
+  }
+  if (e.target.dataset && e.target.dataset.change === 'cal-due') { const id=e.target.dataset.id, due=e.target.value; if (!/^\d{4}-\d{2}-\d{2}$/.test(due) || !Number.isFinite(parseD(due).getTime()) || ymd(parseD(due))!==due) { toast('Некорректная дата'); render(); return; } const changed=commit(()=>{const t=D.tasks.find(x=>x.id===id && !x.archived); if(!t) throw new Error('Задача не найдена'); t.due=due; t.updatedAt=Date.now();}); if(changed) toast('Новый срок поставлен в очередь сохранения'); else render(); return; } if(e.target.id==='ext-status'){EXT.status=e.target.value;render();} else if(e.target.id==='ext-priority'){EXT.priority=e.target.value;render();} else if(e.target.id==='ext-scope'){EXT.scope=e.target.value;render();} else if(e.target.id==='ext-period'){EXT.period=Number(e.target.value);render();} else if(e.target.id==='ext-import'){const f=e.target.files&&e.target.files[0];if(f)restoreFrom(f);}  if (e.target.dataset && e.target.dataset.change === 'j-sort') { U.jSort = e.target.value; render(); } });
+document.addEventListener('click',e=>{if(e.target && e.target.id==='skipp-diagnostics')showDiagnostics();});
 document.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'quick') { e.preventDefault(); quickAdd(); } });
 $('#fab-v').addEventListener('click', openVoice);
 $('#fab').addEventListener('click', () => { if (U.tab === 'orders') openTaskForm(null, {forOrder:true}); else if (U.tab === 'cal') openTaskForm(null, {task:{due:U.sel}}); else openTaskForm(null); });

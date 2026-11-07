@@ -1,5 +1,5 @@
-// СКиПП: изолированный офлайн-кэш версии 20.
-const CACHE = 'skipp-v27';
+// СКиПП: изолированный офлайн-кэш версии 4.3
+const CACHE = 'skipp-v48';
 const PREFIX = 'skipp-v';
 const CORE = ['./', 'index.html', 'manifest.json', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'styles.css', 'app.js'];
 self.addEventListener('install', event => {
@@ -33,7 +33,7 @@ self.addEventListener('fetch', event => {
     }));
     return;
   }
-  if (url.origin === location.origin) {
+  if (url.origin === location.origin && CORE.some(path => new URL(path, self.registration.scope).pathname === url.pathname)) {
     event.respondWith(caches.match(req).then(hit => {
       const update = refresh(req);
       if (hit) { event.waitUntil(update); return hit; }
