@@ -148,6 +148,7 @@ if (SKIPP_CHANNEL) SKIPP_CHANNEL.onmessage = event => {
   saveNotice('Изменения в другой вкладке — обновите страницу', 'error');
 };
 function checkExternalChange(){
+  if (PRIMARY_IDB_ENABLED) return; // IndexedDB compare-and-swap is authoritative.
   const current = localStorage.getItem(KEY);
   if (BASELINE_READY && current !== LAST_RAW) {
     setReadOnly(new Error('База изменена другой вкладкой или процессом'));
@@ -179,8 +180,14 @@ async function writeMain(value, pinMetadata, force=false){
     });
   }
   // On a crash between IDB commit and this mirror, startup repairs the mirror.
-  storageWrite(KEY,value);
   LAST_RAW = value; BASELINE_READY = true;
+  try { storageWrite(KEY,value); }
+  catch (err) {
+    if (!PRIMARY_IDB_ENABLED) throw err;
+    // Main transaction is already committed; a legacy mirror failure is not data loss.
+    console.warn('IndexedDB сохранена; зеркало localStorage недоступно',err);
+    saveNotice('Сохранено в IndexedDB; зеркало недоступно', 'done');
+  }
   notifyOtherTabs(value);
   if (!force && previous && previous !== value) {
     let transition = false;
@@ -250,6 +257,25 @@ function recoveryDb(){
   }).catch(err => { RECOVERY_DB_PROMISE = null; throw err; });
   return RECOVERY_DB_PROMISE;
 }
+async function eraseAllLocalData(){
+  // Never reload if an IndexedDB transaction fails: otherwise startup could restore the old PIN.
+  await IDB_WRITE_QUEUE;
+  await RECOVERY_SNAPSHOT_QUEUE;
+  if (PENDING_WRITES) throw new Error('Дождитесь завершения сохранения');
+  const db = await recoveryDb();
+  await new Promise((resolve,reject) => {
+    const tx = db.transaction(['primary','snapshots'],'readwrite');
+    tx.objectStore('primary').clear();
+    tx.objectStore('snapshots').clear();
+    tx.oncomplete=resolve;
+    tx.onabort=()=>reject(tx.error || new Error('Не удалось очистить IndexedDB'));
+    tx.onerror=()=>{};
+  });
+  // No legacy data may survive and be migrated back to an empty IndexedDB.
+  for (const key of [KEY,PIN_KEY,'skipp_pin_fail','skipp_aux','skipp_dx','skipp_legacy_conflict_v14',UKEY]) localStorage.removeItem(key);
+  LAST_RAW=null; BASELINE_READY=false;
+  notifyOtherTabs('');
+}
 async function recoveryPut(raw){
   if (!raw) return false;
   const db = await recoveryDb();
@@ -315,6 +341,33 @@ async function offerRecovery(){
   } catch(err){ toast('Не удалось восстановить резервный снимок'); console.error(err); }
 }
 const VALID_COLLECTIONS = ['tasks','boards','bcards','people','mcols','subs','journal','trash'];
+const IMPORT_LIMITS = {tasks:30000,boards:300,bcards:30000,people:20000,mcols:1000,subs:30000,journal:30000,trash:30000};
+function validateImportBounds(d){
+  let visited=0;
+  const walk=(value,depth)=>{
+    if (++visited>900000 || depth>22) throw new Error('Превышена сложность файла');
+    if (typeof value==='string' && value.length>200000) throw new Error('Слишком длинное текстовое поле');
+    if (typeof value==='number' && !Number.isFinite(value)) throw new Error('Недопустимое число');
+    if (Array.isArray(value)) {
+      if (value.length>40000) throw new Error('Слишком длинный массив');
+      for(const x of value) walk(x,depth+1);
+    } else if (value && typeof value==='object') {
+      const keys=Object.keys(value);
+      if (keys.length>350) throw new Error('Слишком много полей');
+      for(const k of keys) { if (k==='__proto__' || k==='constructor' || k==='prototype') throw new Error('Недопустимое поле'); walk(value[k],depth+1); }
+    }
+  };
+  for (const [name,limit] of Object.entries(IMPORT_LIMITS)) {
+    if (Array.isArray(d[name]) && d[name].length>limit) throw new Error('Слишком много записей: '+name);
+  }
+  walk(d,0);
+  for(const t of d.tasks){
+    if (typeof t.id!=='string' || !t.id || t.id.length>200) throw new Error('Некорректный идентификатор задачи');
+    if (t.assignees && t.assignees.length>500) throw new Error('Слишком много исполнителей');
+    if (t.checklist && t.checklist.length>1000) throw new Error('Слишком длинный чек-лист');
+  }
+  return d;
+}
 function validateData(d){
   if (!d || typeof d !== 'object' || Array.isArray(d) || !Array.isArray(d.tasks)) throw new Error('Некорректная база задач');
   for (const k of VALID_COLLECTIONS) if (Object.prototype.hasOwnProperty.call(d,k) && !Array.isArray(d[k])) throw new Error('Неверный формат: ' + k);
@@ -328,7 +381,7 @@ function validateData(d){
   for (const t of d.trash || []) if (t.cards != null && !Array.isArray(t.cards)) throw new Error('Некорректная корзина');
   if (d.settings && d.settings.dash != null && (typeof d.settings.dash !== 'object' || Array.isArray(d.settings.dash))) throw new Error('Некорректная панель');
   if (d.settings && ['taskStatuses','asgStatuses'].some(k => d.settings[k] != null && !Array.isArray(d.settings[k]))) throw new Error('Некорректные статусы');
-  return d;
+  return validateImportBounds(d);
 }
 function setReadOnly(reason){ STORAGE_READONLY = true; console.error(reason); setTimeout(() => toast('Данные не загружены или не сохранены. Работа только для чтения; восстановите резервную копию.'), 100); }
 function storageWrite(key, value){ localStorage.setItem(key, value); if (localStorage.getItem(key) !== value) throw new Error('Не удалось проверить запись'); }
@@ -2033,21 +2086,21 @@ function backup(){
   if (PENDING_WRITES || STORAGE_READONLY || !STORAGE_OK || SEC.locked) { toast('Дождитесь завершения сохранения перед выгрузкой'); return; }
   const sh = openSheet(head('Выгрузить данные') + '<div class="sh-b">'
     + '<p class="hint" style="margin:0">Задайте пароль на файл — без него данные из файла не прочитать. Пароль понадобится при загрузке на другом устройстве, восстановить его нельзя.</p>'
-    + '<label class="fld"><span class="lbl">Пароль на файл</span><input type="password" id="bk-p1" autocomplete="new-password" placeholder="Не короче 4 символов"></label>'
+    + '<label class="fld"><span class="lbl">Пароль на файл</span><input type="password" id="bk-p1" autocomplete="new-password" placeholder="Не короче 12 символов"></label>'
     + '<label class="fld"><span class="lbl">Повторите пароль</span><input type="password" id="bk-p2" autocomplete="new-password"></label>'
     + '<div id="bk-ready" hidden class="banner" style="margin:0">Файл зашифрован и готов. Нажмите «Сохранить / отправить».</div>'
     + '</div><div class="sh-f"><button type="button" class="btn ghost" id="bk-plain">Без пароля</button><span class="sp"></span><button type="button" class="btn primary" id="bk-go">Зашифровать</button></div>', {small:true});
   let blob = null;
   const name = 'skipp_dannye_' + today() + '.json';
   $('#bk-plain', sh).addEventListener('click', async () => {
-    if (!(await confirmDlg('Файл без пароля может прочитать любой, к кому он попадёт. Выгрузить без пароля?', 'Выгрузить'))) return;
+    if (!(await confirmDlg('НЕЗАЩИЩЁННАЯ КОПИЯ: любой получивший файл сможет прочитать все данные. Вы уверены, что хотите выгрузить без пароля?', 'Выгрузить'))) return;
     const data = new Blob([JSON.stringify(D, null, 1)], {type:'application/json'});
     const ok = await saveFile(name, data); if (ok) { if (ok === true) { noteBackupExport(false); } closeSheet(); }
   });
   $('#bk-go', sh).addEventListener('click', async e => {
     if (blob) { const ok = await saveFile(name, blob); if (ok) { if (ok === true) { noteBackupExport(true); } closeSheet(); } return; }
     const p1 = $('#bk-p1', sh).value, p2 = $('#bk-p2', sh).value;
-    if (p1.length < 4) { toast('Пароль — не короче 4 символов'); $('#bk-p1', sh).focus(); return; }
+    if (p1.length < 12) { toast('Пароль — не короче 12 символов'); $('#bk-p1', sh).focus(); return; }
     if (p1 !== p2) { toast('Пароли не совпадают'); $('#bk-p2', sh).focus(); return; }
     if (!CRYPTO_OK) { toast('Шифрование недоступно в этом браузере'); return; }
     const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Шифрую…';
@@ -2079,7 +2132,7 @@ function askFilePassword(env, done){
   setTimeout(() => $('#fp-p', sh).focus(), 80);
 }
 function restoreFrom(file){
-  if (!file || file.size > 50 * 1024 * 1024) { toast('Файл слишком большой (максимум 50 МБ)'); return; }
+  if (!file || file.size > 20 * 1024 * 1024) { toast('Файл слишком большой (максимум 20 МБ)'); return; }
   const r = new FileReader();
   r.onerror = () => toast('Не удалось прочитать файл резервной копии');
   r.onload = () => {
@@ -2116,7 +2169,7 @@ function settingsGroupHtml(g){
     + [['mine','Мои задачи'],['orders','Указания']].map(x => '<div class="set-line"><span>'+x[1]+'</span><div class="seg" data-view="'+x[0]+'">'+[['list','Список'],['kanban','Канбан']].map(v => '<button type="button" data-v="'+v[0]+'" class="'+(D.settings.views[x[0]] === v[0] ? 'on' : '')+'">'+v[1]+'</button>').join('')+'</div></div>').join('') + '</div>'
     + '<div class="set-sec"><h3>Статусы</h3><p>В канбане столбцы — это статусы. Их можно добавить, переименовать и перекрасить.</p><div class="btn-row"><button type="button" class="btn sm" data-s="st-task">'+ic('boards', 16)+'Мои статусы</button><button type="button" class="btn sm" data-s="st-asg">'+ic('me', 16)+'Статусы исполнителей</button></div></div>'
     + '<div class="set-sec"><h3>Штаб</h3><div class="btn-row"><button type="button" class="btn sm" data-s="dash">'+ic('hq', 16)+'Блоки штаба</button></div></div>';
-  if (g === 'safe') return '<p style="margin:0">'+(pinSet() ? (pinRecV2() ? 'Код-пароль включён. Данные на устройстве зашифрованы этим кодом.' : 'Код-пароль включён.') : 'Код-пароль выключен. Задайте код из 4 цифр — он будет запрашиваться при запуске, а данные на устройстве будут зашифрованы.')+'</p>'
+  if (g === 'safe') return '<p style="margin:0">'+(pinSet() ? (pinRecV2() ? 'Код включён. Данные зашифрованы, но цифровой PIN можно подобрать при доступе к копии базы. Для особо важных данных используйте длинный пароль и зашифрованные резервные копии.' : 'Код-пароль включён.') : 'Код выключен. Цифровой PIN удобен для входа, но недостаточно устойчив к офлайн-перебору зашифрованной базы.')+'</p>'
     + (pinSet() ? '<div class="fld"><span class="lbl">Автоблокировка</span><div class="seg" id="st-al">'+[[0,'Сразу'],[1,'1 мин'],[5,'5 мин'],[15,'15 мин'],[-1,'Выкл']].map(x => '<button type="button" data-v="'+x[0]+'" class="'+(autolockMin() === x[0] ? 'on' : '')+'">'+x[1]+'</button>').join('')+'</div><span class="hint" style="margin:0">Если приложение свёрнуто дольше этого времени, при возврате снова нужен код. Пока свёрнуто, содержимое скрыто.</span></div>' : '')
     + (SEC.decoy ? '' : '<div class="btn-row">' + (pinSet() ? '<button type="button" class="btn sm" data-s="pin-set">Сменить код</button><button type="button" class="btn sm danger-o" data-s="alarm">Тревога'+(auxRec() ? ' (вкл.)' : '')+'</button><button type="button" class="btn sm danger-o" data-s="pin-off">Выключить код</button>' : '<button type="button" class="btn sm primary" data-s="pin-set">Включить код-пароль</button>') + '</div>');
   if (g === 'data') return (SEC.decoy ? '' : '<p style="margin:0">Всё хранится только на этом устройстве и никуда не отправляется. Чтобы перенести задачи на другое устройство, выгрузите файл, передайте его любым способом (Telegram, почта, AirDrop) и загрузите там.</p>'
@@ -2401,7 +2454,7 @@ function askPin(then){
   }, {digits:rec.digits === 6 ? 6 : 4, forgot: async api => {
     api.close();
     const ok = await confirmDlg('Код восстановить нельзя. Можно сбросить приложение: будут удалены ВСЕ задачи и данные на этом устройстве. Если у вас есть выгруженный файл, данные можно будет загрузить из него.', 'Удалить всё и сбросить');
-    if (ok) { try { localStorage.removeItem(PIN_KEY); localStorage.removeItem(KEY); localStorage.removeItem('skipp_pin_fail'); } catch (e) {} location.reload(); }
+    if (ok) { try { await eraseAllLocalData(); location.reload(); } catch (e) { console.error(e); toast('Сброс не завершён. Данные могут сохраняться — повторите попытку после закрытия других вкладок.'); askPin(then); } }
     else askPin(then);
   }});
 }

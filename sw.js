@@ -1,5 +1,5 @@
-// СКиПП: изолированный офлайн-кэш версии 4.3
-const CACHE = 'skipp-v48';
+// СКиПП: изолированный офлайн-кэш версии 4.4
+const CACHE = 'skipp-v49';
 const PREFIX = 'skipp-v';
 const CORE = ['./', 'index.html', 'manifest.json', 'icon-180.png', 'icon-192.png', 'icon-512.png', 'styles.css', 'app.js'];
 self.addEventListener('install', event => {
